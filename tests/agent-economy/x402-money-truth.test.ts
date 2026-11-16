@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import servicesHandler from '../../api/v1/services.js';
 import offersHandler from '../../api/v1/offers.js';
+import { verifyX402Settlement } from '../../src/agent-economy/x402/settlementVerifier.js';
 
 const originalPayTo = process.env.GXEON_X402_BASE_PAYTO;
 const originalVerified = process.env.GXEON_TREASURY_VERIFIED;
@@ -17,6 +18,8 @@ function response() {
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   if (originalPayTo === undefined) delete process.env.GXEON_X402_BASE_PAYTO;
   else process.env.GXEON_X402_BASE_PAYTO = originalPayTo;
   if (originalVerified === undefined) delete process.env.GXEON_TREASURY_VERIFIED;
@@ -76,5 +79,74 @@ describe('x402 money-truth gate', () => {
     expect(x402Offers).toHaveLength(2);
     expect(x402Offers.every((offer: any) => offer.status === 'PAUSED')).toBe(true);
     expect(x402Offers.every((offer: any) => offer.blocker)).toBe(true);
+  });
+});
+
+describe('x402 receipt verification', () => {
+  const treasury = '0x' + '11'.repeat(20);
+  const buyer = '0x' + '22'.repeat(20);
+  const usdc = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+  const txHash = '0x' + '33'.repeat(32);
+
+  it('keeps authorization-only payments out of settled revenue', async () => {
+    vi.stubEnv('GXEON_X402_BASE_PAYTO', treasury);
+    vi.stubEnv('GXEON_TREASURY_VERIFIED', 'true');
+    vi.stubEnv('GXEON_X402_ALLOW_TEST_PROOFS', 'true');
+    const result = await verifyX402Settlement({
+      x402Version: 2,
+      resource: { url: 'https://example.com/x402/json-validate' },
+      accepted: {
+        scheme: 'exact', network: 'eip155:8453', asset: usdc, amount: '10000',
+        payTo: treasury, maxTimeoutSeconds: 60,
+      },
+      payload: {
+        signature: '0xtest_sig_authorization_only',
+        authorization: {
+          from: buyer, to: treasury, value: '10000', validAfter: 0,
+          validBefore: Math.floor(Date.now() / 1000) + 60, nonce: '0x' + '44'.repeat(32),
+        },
+      },
+    }, '10000');
+
+    expect(result.verified).toBe(false);
+    expect(result.error).toContain('finalized USDC transfer');
+    expect(result.amountAtomic).toBe('0');
+  });
+
+  it.each([
+    { head: '0x63', sender: buyer, verified: false },
+    { head: '0x64', sender: treasury, verified: false },
+    { head: '0x64', sender: buyer, verified: true },
+  ])('checks payment finality and payer ($head, verified=$verified)', async ({ head, sender, verified }) => {
+    vi.stubEnv('GXEON_X402_BASE_PAYTO', treasury);
+    vi.stubEnv('GXEON_TREASURY_VERIFIED', 'true');
+
+    const send = vi.fn(async (_url: string, init: RequestInit) => {
+      const request = JSON.parse(String(init.body));
+      if (request.method === 'eth_getTransactionReceipt') {
+        return Response.json({
+          result: {
+            status: '0x1', transactionHash: txHash, blockNumber: '0x64', from: sender,
+            logs: [{
+              address: usdc,
+              topics: [
+                '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
+                '0x' + sender.slice(2).padStart(64, '0'),
+                '0x' + treasury.slice(2).padStart(64, '0'),
+              ],
+              data: '0x2710',
+            }],
+          },
+        });
+      }
+      expect(request.method).toBe('eth_getBlockByNumber');
+      expect(request.params).toEqual(['finalized', false]);
+      return Response.json({ result: { number: head } });
+    });
+    vi.stubGlobal('fetch', send);
+
+    const result = await verifyX402Settlement({ network: 'eip155:8453', txHash }, '10000');
+    expect(result.verified).toBe(verified);
+    if (verified) expect(result).toMatchObject({ txHash, payer: buyer, amountAtomic: '10000', blockNumber: 100 });
   });
 });

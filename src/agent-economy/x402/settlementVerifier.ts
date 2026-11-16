@@ -1,372 +1,178 @@
-import { getAddress } from 'viem';
-import {
-  X402PaymentProof,
-  X402SettlementVerification,
-  X402PaymentPayload,
-} from './types.js';
-import { getNetwork } from './networks.js';
+import { createHash } from 'node:crypto';
+import { createPublicClient, http, isAddress, parseAbiItem, parseEventLogs, type Address, type Hex } from 'viem';
+import { base } from 'viem/chains';
 import { getAgentEconomyStore } from '../store.js';
-import { FORBIDDEN_EXAMPLE_ADDRESS } from './treasuryVerifier.js';
+import type { X402AcceptOption, X402PaymentPayload, X402SettlementVerification } from './types.js';
 
-// ERC20 Transfer event signature: Transfer(address,address,uint256)
-const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const authorizationUsed = parseAbiItem('event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce)');
+const transfer = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)');
+const hashPattern = /^0x[0-9a-f]{64}$/i;
 
-// Phase 5 Treasury Safety Policy constants
-export const MAX_SINGLE_PAYMENT_USDC = Number(process.env.GXEON_MAX_SINGLE_PAYMENT_USDC || 100);
-export const ALLOWED_NETWORKS = ['eip155:8453'];
-export const ALLOWED_ASSETS = ['0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'.toLowerCase()];
+export function getPaymentPayload(header: string, requirements: X402AcceptOption, resourceUrl: string): X402PaymentPayload | null {
+  if (header.length > 12_000) return null;
+  try {
+    const packet = JSON.parse(header.startsWith('{') ? header : Buffer.from(header, 'base64').toString('utf8'));
+    const accepted = packet?.accepted;
+    const { authorization: auth, signature } = packet?.payload ?? {};
+    if (packet?.x402Version !== 2 ||
+        (packet.resource && packet.resource.url !== resourceUrl) ||
+        accepted?.scheme !== requirements.scheme || accepted.network !== requirements.network ||
+        accepted.amount !== requirements.amount || !sameAddress(accepted.asset, requirements.asset) ||
+        !sameAddress(accepted.payTo, requirements.payTo) ||
+        typeof auth?.from !== 'string' || !isAddress(auth.from) ||
+        sameAddress(auth.from, requirements.payTo) || !sameAddress(auth.to, requirements.payTo) ||
+        String(auth.value) !== requirements.amount ||
+        typeof auth.nonce !== 'string' || !hashPattern.test(auth.nonce) ||
+        !/^\d{1,12}$/.test(String(auth.validAfter)) || !/^\d{1,12}$/.test(String(auth.validBefore)) ||
+        typeof signature !== 'string' || !/^0x(?:[0-9a-f]{2}){64,4096}$/i.test(signature)) {
+      return null;
+    }
+    return {
+      x402Version: 2,
+      resource: { url: resourceUrl, mimeType: 'application/json' },
+      accepted: requirements,
+      payload: {
+        signature: signature.toLowerCase(),
+        authorization: {
+          from: auth.from.toLowerCase(),
+          to: requirements.payTo,
+          value: requirements.amount,
+          validAfter: String(auth.validAfter),
+          validBefore: String(auth.validBefore),
+          nonce: auth.nonce.toLowerCase(),
+        },
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sameAddress(value: unknown, expected: string) {
+  return typeof value === 'string' && value.toLowerCase() === expected.toLowerCase();
+}
+
+type PaymentResult =
+  | { kind: 'confirmed'; proof: X402SettlementVerification }
+  | { kind: 'invalid'; message: string }
+  | { kind: 'pending' }
+  | { kind: 'conflict' };
+
+async function callFacilitator(facilitator: string, operation: 'verify' | 'settle', payment: X402PaymentPayload) {
+  const response = await fetch(facilitator + '/' + operation, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ x402Version: 2, paymentPayload: payment, paymentRequirements: payment.accepted }),
+    redirect: 'error',
+    signal: AbortSignal.timeout(operation === 'verify' ? 6_000 : 18_000),
+  });
+  const data = await response.json();
+  if (operation === 'verify' && !response.ok && data?.isValid !== false) {
+    throw new Error('Facilitator verification unavailable');
+  }
+  return data;
+}
 
 export async function verifyX402Settlement(
-  paymentData: X402PaymentPayload | X402PaymentProof,
-  requiredAmountAtomic: string,
-  _serviceId?: string
-): Promise<X402SettlementVerification> {
+  payment: X402PaymentPayload,
+  facilitator: string,
+  requestHash: string,
+): Promise<PaymentResult> {
   const store = getAgentEconomyStore();
+  const { authorization: auth } = payment.payload;
+  const settlementId = createHash('sha256').update(auth.from + ':' + auth.nonce).digest('hex');
+  const client = createPublicClient({
+    chain: base,
+    transport: http(process.env.BASE_RPC_URL || base.rpcUrls.default.http[0], { timeout: 4500, retryCount: 0 }),
+  });
 
-  // Determine if canonical PaymentPayload or legacy/upfront proof
-  const canonical = (paymentData as X402PaymentPayload)?.accepted?.network
-    ? paymentData as X402PaymentPayload : undefined;
-  const networkId = canonical?.accepted.network ?? (paymentData as X402PaymentProof)?.network ?? '';
-  const network = getNetwork(networkId);
+  let intent = await store.getX402PaymentIntent(settlementId);
+  if (intent && intent.requestHash !== requestHash) return { kind: 'conflict' };
 
-  if (!network || !network.operational) {
-    await store.recordSecurityEvent('invalidPaymentsBlocked');
-    return {
-      verified: false,
-      settlementId: '',
-      network: networkId,
-      txHash: '',
-      payer: '',
-      recipient: '',
-      amountAtomic: '0',
-      amountUsdc: 0,
-      asset: '',
-      timestamp: new Date().toISOString(),
-      error: `Network ${networkId} is unsupported, unverified, or disabled`,
-    };
-  }
+  if (await client.getChainId() !== base.id) throw new Error('Base RPC returned an unexpected chain');
+  if (!intent) {
+    const now = Math.floor(Date.now() / 1000);
+    if (Number(auth.validBefore) <= now || Number(auth.validAfter) > now ||
+        Number(auth.validBefore) > now + payment.accepted.maxTimeoutSeconds + 30) {
+      return { kind: 'invalid', message: 'Payment authorization expiry does not match the quoted terms.' };
+    }
 
-  // Phase 5: Allowed networks policy check
-  if (!ALLOWED_NETWORKS.includes(networkId)) {
-    await store.recordSecurityEvent('invalidPaymentsBlocked');
-    return {
-      verified: false,
-      settlementId: '',
-      network: networkId,
-      txHash: '',
-      payer: '',
-      recipient: '',
-      amountAtomic: '0',
-      amountUsdc: 0,
-      asset: network.usdcAsset,
-      timestamp: new Date().toISOString(),
-      error: `Network ${networkId} is not permitted by policy (allowed: ${ALLOWED_NETWORKS.join(', ')})`,
-    };
-  }
+    const verified = await callFacilitator(facilitator, 'verify', payment);
+    if (verified?.isValid !== true || (verified.payer && !sameAddress(verified.payer, auth.from))) {
+      return { kind: 'invalid', message: 'The facilitator did not verify the authorization.' };
+    }
 
-  // Phase 5: Allowed assets policy check
-  if (!ALLOWED_ASSETS.includes(network.usdcAsset.toLowerCase())) {
-    await store.recordSecurityEvent('invalidPaymentsBlocked');
-    return {
-      verified: false,
-      settlementId: '',
-      network: networkId,
-      txHash: '',
-      payer: '',
-      recipient: '',
-      amountAtomic: '0',
-      amountUsdc: 0,
-      asset: network.usdcAsset,
-      timestamp: new Date().toISOString(),
-      error: `Asset ${network.usdcAsset} is not permitted by policy`,
-    };
-  }
+    const firstBlock = await client.getBlockNumber();
+    const reservation = await store.reserveX402PaymentIntent({
+      id: settlementId,
+      requestHash,
+      firstBlock: String(firstBlock),
+    });
+    intent = reservation.record;
 
-  // Security gate: Treasury must NOT be the example address
-  if (network.treasuryPayTo.toLowerCase() === FORBIDDEN_EXAMPLE_ADDRESS) {
-    await store.recordSecurityEvent('circuitBreakerEvents');
-    return {
-      verified: false,
-      settlementId: '',
-      network: networkId,
-      txHash: '',
-      payer: '',
-      recipient: network.treasuryPayTo,
-      amountAtomic: '0',
-      amountUsdc: 0,
-      asset: network.usdcAsset,
-      timestamp: new Date().toISOString(),
-      error: 'SECURITY VIOLATION: Treasury address is the prohibited x402 example address',
-    };
-  }
-
-  const suppliedHash = canonical?.payload?.txHash ?? (paymentData as X402PaymentProof)?.txHash;
-  const testProof = process.env.NODE_ENV === 'test' &&
-    process.env.GXEON_X402_ALLOW_TEST_PROOFS === 'true' &&
-    typeof suppliedHash === 'string' && suppliedHash.startsWith('0xtest_');
-
-  if (typeof suppliedHash !== 'string' || (!testProof && !/^0x[0-9a-f]{64}$/i.test(suppliedHash))) {
-    await store.recordSecurityEvent('invalidPaymentsBlocked');
-    return {
-      verified: false,
-      settlementId: '',
-      network: networkId,
-      txHash: '',
-      payer: '',
-      recipient: network.treasuryPayTo,
-      amountAtomic: '0',
-      amountUsdc: 0,
-      asset: network.usdcAsset,
-      timestamp: new Date().toISOString(),
-      error: 'Provide the hash of a finalized USDC transfer on Base.',
-    };
-  }
-  const rawTxHash = suppliedHash.toLowerCase();
-
-  // Replay check on txHash
-  const cleanId = rawTxHash.toLowerCase().replace(/[^a-z0-9_]/g, '_');
-  const existingSettlement = await store.getX402Settlement(rawTxHash);
-  const existingJob = (await store.getJob(`job_x402_${cleanId}`)) || (await store.getJob(`x402_${cleanId}`));
-
-  if (existingSettlement || existingJob) {
-    await store.recordSecurityEvent('replaysBlocked');
-    return {
-      verified: false,
-      settlementId: rawTxHash,
-      network: networkId,
-      txHash: rawTxHash,
-      payer: '',
-      recipient: network.treasuryPayTo,
-      amountAtomic: '0',
-      amountUsdc: 0,
-      asset: network.usdcAsset,
-      timestamp: new Date().toISOString(),
-      error: 'Transaction hash has already been consumed (replay blocked)',
-    };
-  }
-
-  // Verify required amount <= MAX_SINGLE_PAYMENT_USDC
-  const requiredUsdc = Number(requiredAmountAtomic) / 1_000_000;
-  if (requiredUsdc > MAX_SINGLE_PAYMENT_USDC) {
-    return {
-      verified: false,
-      settlementId: rawTxHash,
-      network: networkId,
-      txHash: rawTxHash,
-      payer: '',
-      recipient: network.treasuryPayTo,
-      amountAtomic: requiredAmountAtomic,
-      amountUsdc: requiredUsdc,
-      asset: network.usdcAsset,
-      timestamp: new Date().toISOString(),
-      error: `Payment amount (${requiredUsdc} USDC) exceeds maximum allowed single payment (${MAX_SINGLE_PAYMENT_USDC} USDC)`,
-    };
-  }
-
-  // Test proof bypass for test suite if enabled (disabled in production)
-  if (testProof) {
-    return {
-      verified: true,
-      settlementId: rawTxHash,
-      network: networkId,
-      txHash: rawTxHash,
-      payer: '0xtest_buyer',
-      recipient: network.treasuryPayTo,
-      amountAtomic: requiredAmountAtomic,
-      amountUsdc: requiredUsdc,
-      asset: network.usdcAsset,
-      blockNumber: 12345678,
-      timestamp: new Date().toISOString(),
-      paymentFlow: 'upfront',
-    };
-  }
-
-  // Base EVM JSON-RPC On-Chain Receipt Check
-  if (networkId === 'eip155:8453') {
-    try {
-      const response = await fetch(network.rpcUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: AbortSignal.timeout(6000),
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'eth_getTransactionReceipt',
-          params: [rawTxHash],
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Base RPC returned HTTP ${response.status}`);
+    if (intent.requestHash !== requestHash) return { kind: 'conflict' };
+    if (reservation.created) {
+      const submitted = await callFacilitator(facilitator, 'settle', payment).catch(() => null);
+      if (submitted?.network === payment.accepted.network &&
+          typeof submitted.transaction === 'string' && hashPattern.test(submitted.transaction)) {
+        const txHash = submitted.transaction.toLowerCase();
+        intent = { ...intent, txHash };
+        await store.setX402PaymentTransaction(settlementId, txHash);
       }
-
-      const json = (await response.json()) as {
-        result?: {
-          status: string;
-          transactionHash: string;
-          blockNumber: string;
-          from: string;
-          to: string;
-          logs: Array<{
-            address: string;
-            topics: string[];
-            data: string;
-          }>;
-        };
-      };
-
-      const receipt = json.result;
-      if (!receipt) {
-        await store.recordSecurityEvent('invalidPaymentsBlocked');
-        return {
-          verified: false,
-          settlementId: rawTxHash,
-          network: networkId,
-          txHash: rawTxHash,
-          payer: '',
-          recipient: network.treasuryPayTo,
-          amountAtomic: '0',
-          amountUsdc: 0,
-          asset: network.usdcAsset,
-          timestamp: new Date().toISOString(),
-          error: 'Transaction receipt not found on Base mainnet (pending or invalid hash)',
-        };
-      }
-
-      if (receipt.status !== '0x1' || receipt.transactionHash?.toLowerCase() !== rawTxHash) {
-        await store.recordSecurityEvent('invalidPaymentsBlocked');
-        return {
-          verified: false,
-          settlementId: rawTxHash,
-          network: networkId,
-          txHash: rawTxHash,
-          payer: receipt.from,
-          recipient: network.treasuryPayTo,
-          amountAtomic: '0',
-          amountUsdc: 0,
-          asset: network.usdcAsset,
-          timestamp: new Date().toISOString(),
-          error: 'A successful Base receipt matching the transaction hash is required.',
-        };
-      }
-
-      // Match Transfer log to verified Treasury
-      const treasuryClean = getAddress(network.treasuryPayTo).toLowerCase().replace('0x', '');
-      const usdcClean = getAddress(network.usdcAsset).toLowerCase();
-
-      let matchedAmountAtomic = BigInt(0);
-      let payerAddress = '';
-
-      for (const log of receipt.logs || []) {
-        if (log.address.toLowerCase() === usdcClean && log.topics[0] === TRANSFER_TOPIC) {
-          const toAddress = (log.topics[2] || '').toLowerCase().replace('0x', '').padStart(40, '0').slice(-40);
-          const fromTopic = log.topics[1];
-          if (toAddress === treasuryClean && /^0x[0-9a-f]{64}$/i.test(fromTopic ?? '')) {
-            const sender = fromTopic.toLowerCase().slice(-40);
-            if (sender === treasuryClean || sender === '0'.repeat(40)) continue;
-            if (payerAddress && payerAddress !== '0x' + sender) {
-              throw new Error('Use a transaction from a single payer.');
-            }
-            payerAddress = '0x' + sender;
-            matchedAmountAtomic += BigInt(log.data);
-          }
-        }
-      }
-
-      const requiredBigInt = BigInt(requiredAmountAtomic);
-      if (matchedAmountAtomic < requiredBigInt) {
-        await store.recordSecurityEvent('invalidPaymentsBlocked');
-        return {
-          verified: false,
-          settlementId: rawTxHash,
-          network: networkId,
-          txHash: rawTxHash,
-          payer: payerAddress,
-          recipient: network.treasuryPayTo,
-          amountAtomic: matchedAmountAtomic.toString(),
-          amountUsdc: Number(matchedAmountAtomic) / 1_000_000,
-          asset: network.usdcAsset,
-          timestamp: new Date().toISOString(),
-          error: `Transferred amount (${matchedAmountAtomic}) is less than required (${requiredBigInt})`,
-        };
-      }
-
-      const finality = await fetch(network.rpcUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: AbortSignal.timeout(6000),
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 2,
-          method: 'eth_getBlockByNumber',
-          params: ['finalized', false],
-        }),
-      });
-      if (!finality.ok) throw new Error(`Base finality RPC returned HTTP ${finality.status}`);
-      const { result: finalized } = (await finality.json()) as { result?: { number?: string } };
-      if (!finalized?.number || !/^0x[0-9a-f]+$/i.test(finalized.number) ||
-          !/^0x[0-9a-f]+$/i.test(receipt.blockNumber) ||
-          BigInt(receipt.blockNumber) > BigInt(finalized.number)) {
-        return {
-          verified: false,
-          settlementId: rawTxHash,
-          network: networkId,
-          txHash: rawTxHash,
-          payer: payerAddress,
-          recipient: network.treasuryPayTo,
-          amountAtomic: matchedAmountAtomic.toString(),
-          amountUsdc: Number(matchedAmountAtomic) / 1_000_000,
-          asset: network.usdcAsset,
-          timestamp: new Date().toISOString(),
-          error: 'Wait for the USDC transfer to finalize on Base before retrying.',
-        };
-      }
-
-      return {
-        verified: true,
-        settlementId: rawTxHash,
-        network: networkId,
-        txHash: rawTxHash,
-        payer: payerAddress,
-        recipient: network.treasuryPayTo,
-        amountAtomic: matchedAmountAtomic.toString(),
-        amountUsdc: Number(matchedAmountAtomic) / 1_000_000,
-        asset: network.usdcAsset,
-        blockNumber: Number(BigInt(receipt.blockNumber)),
-        confirmations: Number(BigInt(finalized.number) - BigInt(receipt.blockNumber) + 1n),
-        timestamp: new Date().toISOString(),
-        paymentFlow: 'upfront',
-      };
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await store.recordSecurityEvent('circuitBreakerEvents');
-      return {
-        verified: false,
-        settlementId: rawTxHash,
-        network: networkId,
-        txHash: rawTxHash,
-        payer: '',
-        recipient: network.treasuryPayTo,
-        amountAtomic: '0',
-        amountUsdc: 0,
-        asset: network.usdcAsset,
-        timestamp: new Date().toISOString(),
-        error: `Base RPC verification failed: ${msg}`,
-      };
     }
   }
 
-  return {
-    verified: false,
-    settlementId: rawTxHash,
-    network: networkId,
-    txHash: rawTxHash,
-    payer: '',
-    recipient: network.treasuryPayTo,
-    amountAtomic: '0',
-    amountUsdc: 0,
-    asset: network.usdcAsset,
-    timestamp: new Date().toISOString(),
-    error: `Unsupported network verification for ${networkId}`,
-  };
+  const asset = payment.accepted.asset as Address;
+  const payer = auth.from as Address;
+  const nonce = auth.nonce as Hex;
+  let txHash = intent.txHash as Hex | undefined;
+  if (!txHash) {
+    // An interrupted facilitator call may already have broadcast the transfer.
+    // Locate that authorization's transaction, without asking the buyer to pay again.
+    const firstBlock = BigInt(intent.firstBlock);
+    const tip = await client.getBlockNumber();
+    const searchEnd = firstBlock + 450n;
+    const logs = await client.getLogs({
+      address: asset,
+      event: authorizationUsed,
+      args: { authorizer: payer, nonce },
+      fromBlock: firstBlock,
+      toBlock: tip < searchEnd ? tip : searchEnd,
+      strict: true,
+    });
+    txHash = logs.find(log => !log.removed)?.transactionHash ?? undefined;
+    if (!txHash) {
+      const expired = Number(auth.validBefore) + 45 < Date.now() / 1000;
+      return expired ? { kind: 'invalid', message: 'The authorization expired without a confirmed Base transfer.' } : { kind: 'pending' };
+    }
+    await store.setX402PaymentTransaction(settlementId, txHash);
+  }
+
+  const receipt = await client.getTransactionReceipt({ hash: txHash }).catch(() => null);
+  if (!receipt) return { kind: 'pending' };
+  if (receipt.status !== 'success' || receipt.transactionHash.toLowerCase() !== txHash.toLowerCase() ||
+      receipt.blockNumber <= 0n || receipt.blockNumber > BigInt(Number.MAX_SAFE_INTEGER)) {
+    return { kind: 'invalid', message: 'The Base transaction did not settle successfully.' };
+  }
+
+  const assetLogs = receipt.logs.filter(log => !log.removed && sameAddress(log.address, asset));
+  const authorizationLogs = parseEventLogs({ abi: [authorizationUsed], logs: assetLogs, strict: true });
+  const transferLogs = parseEventLogs({ abi: [transfer], logs: assetLogs, strict: true });
+  const used = authorizationLogs.some(log => sameAddress(log.args.authorizer, auth.from) &&
+    log.args.nonce.toLowerCase() === auth.nonce);
+  const received = transferLogs.some(log => sameAddress(log.args.from, auth.from) &&
+    sameAddress(log.args.to, payment.accepted.payTo) && log.args.value === BigInt(payment.accepted.amount));
+
+  if (!used || !received) {
+    return { kind: 'invalid', message: 'The Base receipt does not prove this exact USDC payment.' };
+  }
+
+  const finalized = await client.getBlock({ blockTag: 'finalized' });
+  if (finalized.number === null || finalized.number < receipt.blockNumber) return { kind: 'pending' };
+  const canonical = await client.getBlock({ blockNumber: receipt.blockNumber });
+  if (canonical.hash === null || canonical.hash.toLowerCase() !== receipt.blockHash.toLowerCase()) {
+    return { kind: 'pending' };
+  }
+
+  return { kind: 'confirmed', proof: { settlementId, txHash, blockNumber: Number(receipt.blockNumber) } };
 }
